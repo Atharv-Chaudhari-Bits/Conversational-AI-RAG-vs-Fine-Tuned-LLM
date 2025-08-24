@@ -14,13 +14,16 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
+# =========================
 # Retrieval / models
-import chromadb
+# =========================
+import faiss
 from transformers import (
     AutoTokenizer,
     AutoModelForSequenceClassification,
     AutoModelForCausalLM,
 )
+from sentence_transformers import SentenceTransformer
 
 # Optional notebook rendering
 import nbformat
@@ -31,7 +34,7 @@ from bs4 import BeautifulSoup
 # =========================
 # Configuration
 # =========================
-CHROMA_DIR_DEFAULT = "./chroma_store"
+FAISS_DIR_DEFAULT = "./nestle_qna.index"
 BM25_PKL_DEFAULT = "./bm25_index.pkl"
 FINETUNED_DIR_DEFAULT = "./finetuned_nestle_gpt2"
 
@@ -137,15 +140,22 @@ def preprocess_query(q: str) -> List[str]:
 # Cached loaders
 # =========================
 @st.cache_resource(show_spinner=False)
-def load_chroma(chroma_dir: str):
-    client = chromadb.PersistentClient(path=chroma_dir)
-    cols = client.list_collections()
-    if not cols:
-        raise RuntimeError("No Chroma collections found.")
-    # Use the first collection (assumed to be your chunks collection)
-    coll = client.get_collection(cols[0].name)
-    return client, coll
-
+def load_faiss(faiss_index_path: str, docstore_path: str):
+    if not os.path.exists(faiss_index_path) or not os.path.exists(docstore_path):
+        raise RuntimeError("FAISS index or docstore not found.")
+    index = faiss.read_index(faiss_index_path)
+    with open(docstore_path, "rb") as f:
+        docstore = pickle.load(f)
+        
+    # Debug info about the loaded docstore
+    if isinstance(docstore, list) and len(docstore) > 0:
+        st.info(f"Loaded {len(docstore)} documents")
+        sample = docstore[0]
+        st.info(f"Document format: {sample.keys() if isinstance(sample, dict) else type(sample)}")
+    else:
+        st.warning("Docstore is empty or not a list")
+        
+    return index, docstore
 
 @st.cache_resource(show_spinner=False)
 def load_bm25(bm25_pkl: str):
@@ -154,6 +164,10 @@ def load_bm25(bm25_pkl: str):
     with open(bm25_pkl, "rb") as f:
         return pickle.load(f)
 
+
+@st.cache_resource(show_spinner=False)
+def load_sentence_transformer():
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 @st.cache_resource(show_spinner=False)
 def load_cross_encoder():
@@ -174,19 +188,28 @@ def load_finetuned(finetuned_dir: str):
 
 
 # =========================
-# Retrieval (Dense via Chroma)
+# Retrieval (Dense via FAISS)
 # =========================
-def retrieve_dense(collection, query: str, k: int = 6) -> List[Dict]:
-    res = collection.query(
-        query_texts=[query],
-        n_results=k,
-        include=["documents", "metadatas", "distances"],
-    )
+def retrieve_dense_faiss(index, docstore, query: str, encoder, k: int = 6) -> List[Dict]:
+    """Embed query, search FAISS, return docs with scores."""
+    q_emb = encoder.encode([query])
+    q_emb = np.array(q_emb).astype("float32")
+
+    D, I = index.search(q_emb, k)
     docs = []
-    for doc, meta, dist in zip(res.get("documents", [[]])[0], res.get("metadatas", [[]])[0], res.get("distances", [[]])[0]):
+    for idx, dist in zip(I[0], D[0]):
+        if idx < 0 or idx >= len(docstore):
+            continue
+        # Handle different document formats
+        doc = docstore[idx]
+        if isinstance(doc, dict):
+            text = doc.get("text") or doc.get("document") or doc.get("Question", "") + " " + doc.get("Answer", "")
+        else:
+            text = str(doc)
+            
         docs.append({
-            "text": doc,
-            "metadata": meta,
+            "text": text,
+            "metadata": doc if isinstance(doc, dict) else {},
             "dense_score": float(1.0 / (1.0 + dist))
         })
     return docs
@@ -238,7 +261,8 @@ def generate_rag_answer(query: str, collection, ce_tok, ce_model, max_new_tokens
     """Return (answer, confidence, latency, contexts)."""
     # Retrieve + rerank
     t0 = time.time()
-    dense = retrieve_dense(collection, query, k=6)
+    embed_model = load_sentence_transformer()  # Get the same model used for index creation
+    dense = retrieve_dense_faiss(faiss_index, docstore, query, embed_model, k=6)
     top_docs = rerank_cross_encoder(query, dense, ce_tok, ce_model, k=3)
     ctx = [d["text"] for d in top_docs]
 
@@ -341,17 +365,26 @@ def main():
     # Sidebar: configuration
     st.sidebar.header("Settings")
     mode = st.sidebar.radio("Mode", ["RAG", "Fine-tuned"], index=0)
-    chroma_dir = st.sidebar.text_input("Chroma store path", CHROMA_DIR_DEFAULT)
+    chroma_dir = st.sidebar.text_input("Chroma store path", FAISS_DIR_DEFAULT)
     bm25_path = st.sidebar.text_input("BM25 index (optional)", BM25_PKL_DEFAULT)
     finetuned_dir = st.sidebar.text_input("Fine-tuned model dir", FINETUNED_DIR_DEFAULT)
     st.sidebar.divider()
 
     with st.sidebar.expander("Notebook Viewer"):
-        nb_path = st.text_input("Path to .ipynb", "./notebooks/Conversation_AI_Financial_Statements_Assignment_part_I.ipynb")
+        notebook_options = {
+            "Part I": "./notebooks/Conversation_AI_Financial_Statements_Assignment_part_I.ipynb",
+            "Part II": "./notebooks/Conversation_AI_Financial_Statements_Assignment_part_II.ipynb",
+            "Part III": "./notebooks/Conversation_AI_Financial_Statements_Assignment_part_III.ipynb"
+        }
+        selected_notebook = st.selectbox("Select Notebook", list(notebook_options.keys()))
+        nb_path = notebook_options[selected_notebook]
+        
         if st.button("Open Notebook"):
             st.session_state["show_nb"] = True
+            st.session_state["current_nb"] = nb_path
         else:
             st.session_state["show_nb"] = st.session_state.get("show_nb", False)
+            st.session_state["current_nb"] = st.session_state.get("current_nb", nb_path)
 
     # Tabs
     tab_qa, tab_nb = st.tabs(["Assistant", "Notebook"])
@@ -363,12 +396,32 @@ def main():
     # Load indexes/models only when needed
     if mode == "RAG":
         try:
-            chroma_client, chroma_coll = load_chroma(chroma_dir)
+            # Initialize global variables for components
+            global faiss_index, docstore
+            
+            # Get the directory containing the files
+            index_dir = os.path.dirname(os.path.abspath(chroma_dir))
+            
+            # Construct paths for both files
+            faiss_path = os.path.join(index_dir, "nestle_qna.index")
+            meta_path = os.path.join(index_dir, "metadata.pkl")
+            
+            # Print paths for debugging
+            st.info(f"Looking for FAISS index at: {faiss_path}")
+            st.info(f"Looking for metadata at: {meta_path}")
+            
+            # Load FAISS components
+            faiss_index, docstore = load_faiss(faiss_path, meta_path)
+            st.success("Successfully loaded FAISS index and metadata")
+            
+            # Load models
             ce_tok, ce_model = load_cross_encoder()
+            embed_model = load_sentence_transformer()
+            
         except Exception as e:
-            st.error(f"Failed to attach Chroma or cross-encoder: {e}")
+            st.error(f"Failed to initialize RAG components: {str(e)}")
+            st.info("Please check that nestle_qna.index and metadata.pkl exist in the same directory")
             return
-        bm25 = load_bm25(bm25_path)  # currently not shown; dense + CE used
 
     if mode == "Fine-tuned":
         try:
@@ -390,7 +443,7 @@ def main():
                 st.caption(f"Reason: {hit.reason}")
             else:
                 if mode == "RAG":
-                    ans, conf, t_taken, ctx = generate_rag_answer(q, chroma_coll, ce_tok, ce_model)
+                    ans, conf, t_taken, ctx = generate_rag_answer(q, None, ce_tok, ce_model)
                     ans = guard_out.clean(guard_out.squash_not_specified(ans))
                     uncertain = guard_out.flag_uncertain(ans)
 
@@ -432,9 +485,13 @@ def main():
     with tab_nb:
         st.subheader("Notebook Viewer")
         if st.session_state.get("show_nb"):
-            render_notebook(nb_path)
+            current_nb = st.session_state.get("current_nb", nb_path)
+            if os.path.exists(current_nb):
+                render_notebook(current_nb)
+            else:
+                st.warning(f"Notebook not found at path: {current_nb}")
         else:
-            st.info("Enter a path and click **Open Notebook** in the sidebar to view an .ipynb file.")
+            st.info("Select a notebook and click **Open Notebook** in the sidebar to view it.")
 
 
 if __name__ == "__main__":

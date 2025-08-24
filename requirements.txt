@@ -1,0 +1,12 @@
+numpy
+chromadb 
+rank-bm25
+pymupdf 
+pdfplumber 
+pytesseract 
+pillow 
+pandas 
+rapidfuzz 
+python-dateutil 
+tabulate 
+pdf2image

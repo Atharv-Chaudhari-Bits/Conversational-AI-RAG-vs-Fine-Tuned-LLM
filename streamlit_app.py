@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import numpy as np
 import streamlit as st
+import pandas as pd
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -337,20 +338,66 @@ footer {visibility: hidden;}
 
 
 # =========================
-# Notebook rendering
+# Notebook and Results handling
 # =========================
-def render_notebook(ipynb_path: str):
-    """Display an ipynb as HTML inside Streamlit."""
+def convert_notebook_to_html(ipynb_path: str) -> str:
+    """Convert notebook to HTML string."""
     if not os.path.exists(ipynb_path):
-        st.warning("Notebook path not found.")
-        return
+        return None
     with open(ipynb_path, "r", encoding="utf-8") as f:
         nb = nbformat.read(f, as_version=4)
+    
+    # Configure HTML export
     html_exporter = HTMLExporter()
+    html_exporter.template_name = 'classic'
+    
+    # Add custom CSS for dark mode and better styling
+    html_exporter.template.module.base_template.resources['css'].append({
+        'text': '''
+        body { background-color: #0e1117; color: #ffffff; }
+        .jp-MarkdownCell { background-color: #1e1e1e; }
+        .jp-CodeCell { background-color: #1e1e1e; }
+        .jp-OutputArea-output { background-color: #262626; }
+        ''',
+        'name': 'custom_dark'
+    })
+    
+    # Convert to HTML
     (body, _resources) = html_exporter.from_notebook_node(nb)
-    # Limit overly bright backgrounds
-    soup = BeautifulSoup(body, "html.parser")
-    st.components.v1.html(str(soup), height=800, scrolling=True)
+    return body
+
+def load_results_csv(notebook_dir: str) -> pd.DataFrame:
+    """Load results.csv from the notebook directory."""
+    results_path = os.path.join(notebook_dir, "results.csv")
+    if os.path.exists(results_path):
+        try:
+            return pd.read_csv(results_path)
+        except Exception as e:
+            st.error(f"Error loading results.csv: {str(e)}")
+    return None
+
+def render_notebook(ipynb_path: str):
+    """Display notebook and results if available."""
+    # Convert and display notebook
+    html_content = convert_notebook_to_html(ipynb_path)
+    if html_content:
+        st.components.v1.html(html_content, height=800, scrolling=True)
+        
+        # Try to load and display results
+        notebook_dir = os.path.dirname(ipynb_path)
+        results_df = load_results_csv(notebook_dir)
+        if results_df is not None:
+            st.subheader("Results Summary")
+            st.dataframe(
+                results_df,
+                use_container_width=True,
+                column_config={
+                    col: st.column_config.NumberColumn(format="%.3f") 
+                    for col in results_df.select_dtypes(include=['float64']).columns
+                }
+            )
+    else:
+        st.warning("Notebook not found.")
 
 
 # =========================
@@ -483,13 +530,38 @@ def main():
 
     # Notebook tab
     with tab_nb:
-        st.subheader("Notebook Viewer")
         if st.session_state.get("show_nb"):
             current_nb = st.session_state.get("current_nb", nb_path)
-            if os.path.exists(current_nb):
-                render_notebook(current_nb)
-            else:
-                st.warning(f"Notebook not found at path: {current_nb}")
+            
+            # Create two columns
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.subheader("Notebook Content")
+                if os.path.exists(current_nb):
+                    html_content = convert_notebook_to_html(current_nb)
+                    if html_content:
+                        st.components.v1.html(html_content, height=800, scrolling=True)
+                    else:
+                        st.warning("Failed to convert notebook to HTML")
+                else:
+                    st.warning(f"Notebook not found at path: {current_nb}")
+            
+            with col2:
+                st.subheader("Results Summary")
+                notebook_dir = os.path.dirname(current_nb)
+                results_df = load_results_csv(notebook_dir)
+                if results_df is not None:
+                    st.dataframe(
+                        results_df,
+                        use_container_width=True,
+                        column_config={
+                            col: st.column_config.NumberColumn(format="%.3f") 
+                            for col in results_df.select_dtypes(include=['float64']).columns
+                        }
+                    )
+                else:
+                    st.info("No results.csv found in the notebook directory")
         else:
             st.info("Select a notebook and click **Open Notebook** in the sidebar to view it.")
 

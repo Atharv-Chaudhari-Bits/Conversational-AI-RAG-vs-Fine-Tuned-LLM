@@ -16,3 +16,4 @@ rapidfuzz
 python-dateutil
 tabulate
 pdf2image
+db-sqlite3
